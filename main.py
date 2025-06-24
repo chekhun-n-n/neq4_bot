@@ -7,132 +7,105 @@ import json
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 import gspread
 from PIL import Image
 import pytesseract
 
-# ----------------------
-# 1. Настройка логирования
-# ----------------------
+
+# 1) Логирование
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ----------------------
-# 2. Чтение переменных окружения
-# ----------------------
-# Telegram
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-if not TELEGRAM_TOKEN:
-    logger.error("ERROR: TELEGRAM_TOKEN не задана")
-    exit(1)
-
-# Google Sheets ID
+# 2) Переменные окружения
+TELEGRAM_TOKEN  = os.getenv('TELEGRAM_TOKEN')
 GOOGLE_SHEET_ID = os.getenv('GOOGLE_SHEET_ID')
-if not GOOGLE_SHEET_ID:
-    logger.error("ERROR: GOOGLE_SHEET_ID не задана")
+if not TELEGRAM_TOKEN or not GOOGLE_SHEET_ID:
+    logger.error("🔴 TELEGRAM_TOKEN и GOOGLE_SHEET_ID должны быть заданы!")
     exit(1)
 
-# JSON ключ (либо из переменной, либо файл)
-env_json = os.getenv('GOOGLE_SERVICE_JSON')
-if env_json:
-    # Восстановить файл ключа из переменной окружения
-    with open('service_account.json', 'w', encoding='utf-8') as f:
-        f.write(env_json)
-    GOOGLE_JSON_PATH = 'service_account.json'
-else:
-    # fallback на файл в репозитории
-    GOOGLE_JSON_PATH = os.getenv(
-        'GOOGLE_JSON_PATH',
-        'sheets-bot-463919-5cf9c9fa0648.json'
-    )
+# 3) Читаем JSON-ключ из переменной GOOGLE_SERVICE_JSON
+svc_json = os.getenv('GOOGLE_SERVICE_JSON')
+if not svc_json:
+    logger.error("🔴 Переменная GOOGLE_SERVICE_JSON не найдена!")
+    exit(1)
 
-# ----------------------
-# 3. Инициализация бота и диспетчера
-# ----------------------
-bot = Bot(token=TELEGRAM_TOKEN)
-dp = Dispatcher(bot)
+# 4) Парсим JSON и создаём Credentials
+info = json.loads(svc_json)
+scopes = ["https://www.googleapis.com/auth/spreadsheets",
+          "https://www.googleapis.com/auth/drive"]
+creds = Credentials.from_service_account_info(info, scopes=scopes)
 
-# ----------------------
-# 4. Подключение к Google Sheets
-# ----------------------
-scope = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive"
-]
-creds = ServiceAccountCredentials.from_json_keyfile_name(
-    GOOGLE_JSON_PATH, scope
-)
+# 5) Авторизуем gspread
 gc = gspread.authorize(creds)
 sheet = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
 
-# ----------------------
-# 5. Обработчики команд и сообщений
-# ----------------------
-@dp.message_handler(commands=['start'])
-async def cmd_start(message: types.Message):
-    text = (
-        "Привет! Я – ваш ассистент-бот.\n\n"
-        "• Перешлите мне фото/скриншот – я распознаю номер задания и километраж.\n"
-        "• Используйте /template <ключ> – я подберу нужный шаблон из Google Sheets.\n"
-    )
-    await message.reply(text)
+# 6) Инициализируем бота
+bot = Bot(token=TELEGRAM_TOKEN)
+dp  = Dispatcher(bot)
 
+
+# 7) /start
+@dp.message_handler(commands=['start'])
+async def cmd_start(msg: types.Message):
+    await msg.reply(
+        "Привет! Я — ассистент-бот.\n\n"
+        "• Перешлите фото, я распознаю задание и км.\n"
+        "• /template <ключ> — найду шаблон в Google Sheets."
+    )
+
+# 8) Обработка фото
 @dp.message_handler(content_types=['photo'])
-async def handle_photo(message: types.Message):
-    # 1) Скачиваем фото
-    file_id = message.photo[-1].file_id
-    file = await bot.get_file(file_id)
-    bio = io.BytesIO()
-    await bot.download_file(file.file_path, destination=bio)
+async def on_photo(msg: types.Message):
+    # загрузка
+    f    = await bot.get_file(msg.photo[-1].file_id)
+    bio  = io.BytesIO()
+    await bot.download_file(f.file_path, destination=bio)
     bio.seek(0)
 
-    # 2) OCR распознавание
+    # OCR
     try:
-        img = Image.open(bio)
+        img  = Image.open(bio)
         text = pytesseract.image_to_string(img, lang='rus').strip()
     except Exception as e:
-        await message.reply(f"Ошибка распознавания: {e}")
-        return
+        return await msg.reply(f"Ошибка OCR: {e}")
 
-    # 3) Парсинг номера задания и километража
-    num = re.search(r'[Зз]адани[ея][: ]+(\w+)', text)
-    km  = re.search(r'(\d+)[\s-]*км', text)
-    job = num.group(1) if num else 'не найден'
-    kmv = km.group(1)  if km  else 'не найден'
+    # Парсинг
+    job = re.search(r'[Зз]адани[ея][: ]+(\w+)', text)
+    km  = re.search(r'(\d+)[\s-]*км',        text)
+    job = job.group(1) if job else 'не найден'
+    km  = km.group(1)  if km  else 'не найден'
 
-    # 4) Ответ пользователю
-    resp = (
+    # Ответ
+    await msg.reply(
         f"📋 *Распознано:*\n"
         f"– Задание: `{job}`\n"
-        f"– Километраж: `{kmv} км`\n\n"
-        f"🗒 Распознанный текст:\n{text}"
+        f"– Километраж: `{km} км`\n\n"
+        f"🗒 Распознанный текст:\n{text}",
+        parse_mode='Markdown'
     )
-    await message.reply(resp, parse_mode='Markdown')
 
+# 9) /template
 @dp.message_handler(commands=['template'])
-async def handle_template(message: types.Message):
-    key = message.get_args().lower().strip()
+async def on_template(msg: types.Message):
+    key = msg.get_args().lower().strip()
     if not key:
-        return await message.reply("Укажите ключ: `/template оплата`", parse_mode='Markdown')
+        return await msg.reply("Укажите ключ: `/template оплата`", parse_mode='Markdown')
 
-    rows = sheet.get_all_records()
-    matches = [r for r in rows if key in r.get('Ключевые слова', '').lower()]
-    if not matches:
-        return await message.reply("Шаблон не найден.")
+    recs = sheet.get_all_records()
+    hits = [r for r in recs if key in r.get('Ключевые слова','').lower()]
+    if not hits:
+        return await msg.reply("Шаблон не найден.")
 
-    for row in matches:
-        cat = row.get('Категория', '')
-        txt = row.get('Шаблон (текст сообщения)', '').strip()
-        link= row.get('Ссылка на видео/файл', '').strip()
-        out = f"📄 *{cat}*\n{txt}"
+    for r in hits:
+        out = f"📄 *{r.get('Категория','')}*\n{r.get('Шаблон (текст сообщения)','')}"
+        link = r.get('Ссылка на видео/файл','').strip()
         if link:
             out += f"\n🔗 {link}"
-        await message.reply(out, parse_mode='Markdown')
+        await msg.reply(out, parse_mode='Markdown')
 
-# ----------------------
-# 6. Запуск бота
-# ----------------------
+# 10) Запуск
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True)
+
 
