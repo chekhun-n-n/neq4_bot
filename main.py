@@ -113,7 +113,7 @@ def yandex_ocr(img_bytes: bytes) -> str:
 @dp.message_handler(commands=['start'])
 async def cmd_start(msg: types.Message):
     await msg.reply(
-        "Привет! Отправь фото — я распознаю *Task ID*, *Slug*, *Задание* и *Километраж* через Яндекс Vision OCR.",
+        "Привет! Отправь фото — я распознаю *Task ID*, *Задание* и *Километраж* через Яндекс Vision OCR.",
         parse_mode='Markdown'
     )
 
@@ -134,14 +134,18 @@ async def handle_photo(msg: types.Message):
     tid_m = re.search(r'\[([^\]]+)\]', text)
     task_id = tid_m.group(1) if tid_m else '—'
 
-    # 2) Slug: первый «слог-ид» из первой строки
-    first_line = text.splitlines()[0]
-    slug_m = re.search(r'([A-Za-z0-9_]+)', first_line)
-    slug = slug_m.group(1) if slug_m else '—'
+    # 2) Raw slug (первую строку) — то, что нужно вставить в задание
+    first_line = text.splitlines()[0].strip()
 
-    # 3) Название задания
+    # 3) Название после «Задание:»
     jt_m = re.search(r'[Зз]адани[ея][: ]+([^\n,;]+)', text)
-    job_title = jt_m.group(1).strip() if jt_m else 'не найдено'
+    job_part = jt_m.group(1).strip() if jt_m else ''
+
+    # Собираем полное задание: первая строка + доп. название
+    if job_part:
+        job_full = f"{first_line} — {job_part}"
+    else:
+        job_full = first_line
 
     # 4) Километраж: сначала в скобках "(NN км)", иначе просто "NN км"
     km_m = re.search(r'\(\s*(\d+(?:[.,]\d+)?)\s*км\s*\)', text)
@@ -151,10 +155,9 @@ async def handle_photo(msg: types.Message):
 
     # Ответ пользователю
     await msg.reply(
-        f"📋 *Результаты распознавания:*\n"
+        f"📋 *Распознано:*\n"
         f"– Task ID: `{task_id}`\n"
-        f"– Slug: `{slug}`\n"
-        f"– Задание: `{job_title}`\n"
+        f"– Задание: `{job_full}`\n"
         f"– Километраж: `{km} км`\n\n"
         f"🗒 *Текст:*\n```{text}```",
         parse_mode='Markdown'
@@ -162,5 +165,3 @@ async def handle_photo(msg: types.Message):
 
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True)
-
-
