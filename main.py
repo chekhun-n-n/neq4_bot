@@ -8,12 +8,11 @@ import re
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
-from PIL import Image
 import requests
-import jwt   # теперь есть в requirements
+import jwt   # из PyJWT[crypto]
 from dotenv import load_dotenv
 
-# --- 1. Загрузка ENV ---
+# --- 1. Загрузка ENV и логгирование ---
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,16 +20,16 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN   = os.getenv('TELEGRAM_TOKEN')
 YANDEX_FOLDER_ID = os.getenv('YANDEX_FOLDER_ID')
 
-# Вы можете хранить JSON-сервисного ключа прямо в переменной:
+# Сервисный ключ можно хранить прямо в ENV
 YANDEX_KEY_JSON = os.getenv('YANDEX_KEY_JSON')
-if not YANDEX_KEY_JSON:
-    # либо на диске (но тогда надо положить yandex_key.json рядом с main.py)
+if YANDEX_KEY_JSON:
+    key = json.loads(YANDEX_KEY_JSON)
+else:
+    # либо файл рядом с main.py
     YANDEX_KEY_FILE = os.getenv('YANDEX_KEY_FILE', 'yandex_key.json')
     assert os.path.exists(YANDEX_KEY_FILE), "YANDEX_KEY_FILE not found!"
     with open(YANDEX_KEY_FILE, 'r') as f:
         key = json.load(f)
-else:
-    key = json.loads(YANDEX_KEY_JSON)
 
 assert TELEGRAM_TOKEN,   "TELEGRAM_TOKEN is not set!"
 assert YANDEX_FOLDER_ID, "YANDEX_FOLDER_ID is not set!"
@@ -42,12 +41,14 @@ dp  = Dispatcher(bot)
 _IAM_TOKEN = None
 _IAM_EXPIRES = 0
 
-def get_iam_token():
+def get_iam_token() -> str:
     global _IAM_TOKEN, _IAM_EXPIRES
+
+    # отдаём закэшированный, если ещё живой
     if _IAM_TOKEN and _IAM_EXPIRES > time.time() + 300:
         return _IAM_TOKEN
 
-    # Формируем JWT
+    # Собираем JWT для Yandex IAM
     now = int(time.time())
     payload = {
         "aud": "https://iam.api.cloud.yandex.net/iam/v1/tokens",
@@ -55,20 +56,22 @@ def get_iam_token():
         "iat": now,
         "exp": now + 360,
     }
-    signed = jwt.encode(
+    signed_jwt = jwt.encode(
         payload,
         key["private_key"],
         algorithm="PS256",
         headers={"kid": key["id"]},
     )
-    # Запрашиваем IAM token
+
+    # Запрашиваем IAM-токен
     resp = requests.post(
         "https://iam.api.cloud.yandex.net/iam/v1/tokens",
-        json={"jwt": signed},
+        json={"jwt": signed_jwt},
         timeout=10
     )
     resp.raise_for_status()
     data = resp.json()
+
     _IAM_TOKEN = data["iamToken"]
     _IAM_EXPIRES = now + 3600 * 11
     return _IAM_TOKEN
@@ -87,7 +90,8 @@ def yandex_ocr(img_bytes: bytes) -> str:
             }]
         }]
     }
-    r = requests.post(
+
+    resp = requests.post(
         "https://vision.api.cloud.yandex.net/vision/v1/batchAnalyze",
         headers={
             "Authorization": f"Bearer {token}",
@@ -96,8 +100,9 @@ def yandex_ocr(img_bytes: bytes) -> str:
         json=payload,
         timeout=20
     )
-    r.raise_for_status()
-    res = r.json()
+    resp.raise_for_status()
+    res = resp.json()
+
     try:
         blocks = res["results"][0]["results"][0]["textDetection"]["pages"][0]["blocks"]
         lines = []
@@ -109,34 +114,51 @@ def yandex_ocr(img_bytes: bytes) -> str:
         logger.error("OCR parsing error: %s\nRaw response: %s", e, res)
         return ""
 
-# --- 4. Telegram Handlers ---
+# --- 4. Телеграм-хендлеры ---
 @dp.message_handler(commands=['start'])
 async def cmd_start(msg: types.Message):
     await msg.reply(
-        "Привет! Отправь мне фото — я вытяну задание и километраж через Яндекс Vision OCR."
+        "Привет! Отправь мне фото — я распознаю Task ID, Задание и Километраж через Yandex Vision OCR."
     )
 
 @dp.message_handler(content_types=['photo'])
 async def handle_photo(msg: types.Message):
+    # Скачиваем изображение
     f_info = await bot.get_file(msg.photo[-1].file_id)
     bio = io.BytesIO()
     await bot.download_file(f_info.file_path, destination=bio)
-    bio.seek(0)
-    text = yandex_ocr(bio.read())
+    img_bytes = bio.getvalue()
+
+    # OCR
+    text = yandex_ocr(img_bytes)
     if not text:
-        return await msg.reply("Не удалось распознать текст.")
-    job = re.search(r'[Зз]адани[ея][: ]+([^\n,;]+)', text)
-    km  = re.search(r'(\d+)\s*км', text)
-    job = job.group(1).strip() if job else 'не найдено'
-    km  = km.group(1)         if km  else 'не найдено'
+        return await msg.reply("❌ Не удалось распознать текст.")
+
+    # Парсинг Task ID из первых скобок [ ... ]
+    tid_m = re.search(r'\[([^\]]+)\]', text)
+    task_id = tid_m.group(1) if tid_m else '—'
+
+    # Парсинг названия задания
+    jt_m = re.search(r'[Зз]адани[ея][: ]+([^\n,;]+)', text)
+    job_title = jt_m.group(1).strip() if jt_m else 'не найдено'
+
+    # Парсинг километража: сначала ищем "(<число> км)", иначе просто "NN км"
+    km_m = re.search(r'\(\s*(\d+(?:[.,]\d+)?)\s*км\s*\)', text)
+    if not km_m:
+        km_m = re.search(r'(\d+(?:[.,]\d+)?)\s*км', text)
+    km = km_m.group(1).replace(',', '.') if km_m else 'не найдено'
+
+    # Отправляем результат
     await msg.reply(
-        f"📋 *Распознано:*\n"
-        f"– Задание: `{job}`\n"
+        f"📋 *Результаты распознавания:*\n"
+        f"– Task ID: `{task_id}`\n"
+        f"– Задание: `{job_title}`\n"
         f"– Километраж: `{km} км`\n\n"
-        f"🗒 Текст:\n```\n{text}\n```",
+        f"🗒 *Текст:*\n```{text}```",
         parse_mode='Markdown'
     )
 
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True)
+
 
