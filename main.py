@@ -43,7 +43,7 @@ def get_iam_token():
         # Упрощённый путь:
         import jwt
         import datetime
-        import requests
+
 
         now = int(time.time())
         payload = {
