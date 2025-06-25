@@ -9,7 +9,7 @@ import re
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 import requests
-import jwt   # из PyJWT[crypto]
+import jwt   # PyJWT[crypto]
 from dotenv import load_dotenv
 
 # --- 1. Загрузка ENV и логгирование ---
@@ -25,7 +25,6 @@ YANDEX_KEY_JSON = os.getenv('YANDEX_KEY_JSON')
 if YANDEX_KEY_JSON:
     key = json.loads(YANDEX_KEY_JSON)
 else:
-    # либо файл рядом с main.py
     YANDEX_KEY_FILE = os.getenv('YANDEX_KEY_FILE', 'yandex_key.json')
     assert os.path.exists(YANDEX_KEY_FILE), "YANDEX_KEY_FILE not found!"
     with open(YANDEX_KEY_FILE, 'r') as f:
@@ -43,12 +42,9 @@ _IAM_EXPIRES = 0
 
 def get_iam_token() -> str:
     global _IAM_TOKEN, _IAM_EXPIRES
-
-    # отдаём закэшированный, если ещё живой
     if _IAM_TOKEN and _IAM_EXPIRES > time.time() + 300:
         return _IAM_TOKEN
 
-    # Собираем JWT для Yandex IAM
     now = int(time.time())
     payload = {
         "aud": "https://iam.api.cloud.yandex.net/iam/v1/tokens",
@@ -63,7 +59,6 @@ def get_iam_token() -> str:
         headers={"kid": key["id"]},
     )
 
-    # Запрашиваем IAM-токен
     resp = requests.post(
         "https://iam.api.cloud.yandex.net/iam/v1/tokens",
         json={"jwt": signed_jwt},
@@ -118,7 +113,8 @@ def yandex_ocr(img_bytes: bytes) -> str:
 @dp.message_handler(commands=['start'])
 async def cmd_start(msg: types.Message):
     await msg.reply(
-        "Привет! Отправь мне фото — я распознаю Task ID, Задание и Километраж через Yandex Vision OCR."
+        "Привет! Отправь фото — я распознаю *Task ID*, *Slug*, *Задание* и *Километраж* через Яндекс Vision OCR.",
+        parse_mode='Markdown'
     )
 
 @dp.message_handler(content_types=['photo'])
@@ -134,24 +130,30 @@ async def handle_photo(msg: types.Message):
     if not text:
         return await msg.reply("❌ Не удалось распознать текст.")
 
-    # Парсинг Task ID из первых скобок [ ... ]
+    # 1) Task ID: цифры внутри [..]
     tid_m = re.search(r'\[([^\]]+)\]', text)
     task_id = tid_m.group(1) if tid_m else '—'
 
-    # Парсинг названия задания
+    # 2) Slug: первый «слог-ид» из первой строки
+    first_line = text.splitlines()[0]
+    slug_m = re.search(r'([A-Za-z0-9_]+)', first_line)
+    slug = slug_m.group(1) if slug_m else '—'
+
+    # 3) Название задания
     jt_m = re.search(r'[Зз]адани[ея][: ]+([^\n,;]+)', text)
     job_title = jt_m.group(1).strip() if jt_m else 'не найдено'
 
-    # Парсинг километража: сначала ищем "(<число> км)", иначе просто "NN км"
+    # 4) Километраж: сначала в скобках "(NN км)", иначе просто "NN км"
     km_m = re.search(r'\(\s*(\d+(?:[.,]\d+)?)\s*км\s*\)', text)
     if not km_m:
         km_m = re.search(r'(\d+(?:[.,]\d+)?)\s*км', text)
     km = km_m.group(1).replace(',', '.') if km_m else 'не найдено'
 
-    # Отправляем результат
+    # Ответ пользователю
     await msg.reply(
         f"📋 *Результаты распознавания:*\n"
         f"– Task ID: `{task_id}`\n"
+        f"– Slug: `{slug}`\n"
         f"– Задание: `{job_title}`\n"
         f"– Километраж: `{km} км`\n\n"
         f"🗒 *Текст:*\n```{text}```",
