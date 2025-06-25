@@ -8,11 +8,12 @@ import re
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
+from PIL import Image
 import requests
-import jwt   # PyJWT[crypto]
+import jwt
 from dotenv import load_dotenv
 
-# --- 1. Загрузка ENV и логгирование ---
+# --- 1. Загрузка ENV ---
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,7 +21,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN   = os.getenv('TELEGRAM_TOKEN')
 YANDEX_FOLDER_ID = os.getenv('YANDEX_FOLDER_ID')
 
-# Сервисный ключ можно хранить прямо в ENV
+# Загружаем ключ сервисного аккаунта
 YANDEX_KEY_JSON = os.getenv('YANDEX_KEY_JSON')
 if YANDEX_KEY_JSON:
     key = json.loads(YANDEX_KEY_JSON)
@@ -36,11 +37,11 @@ assert YANDEX_FOLDER_ID, "YANDEX_FOLDER_ID is not set!"
 bot = Bot(token=TELEGRAM_TOKEN)
 dp  = Dispatcher(bot)
 
-# --- 2. Кэширование IAM-токена ---
+# --- 2. IAM-токен ---
 _IAM_TOKEN = None
 _IAM_EXPIRES = 0
 
-def get_iam_token() -> str:
+def get_iam_token():
     global _IAM_TOKEN, _IAM_EXPIRES
     if _IAM_TOKEN and _IAM_EXPIRES > time.time() + 300:
         return _IAM_TOKEN
@@ -52,26 +53,24 @@ def get_iam_token() -> str:
         "iat": now,
         "exp": now + 360,
     }
-    signed_jwt = jwt.encode(
+    signed = jwt.encode(
         payload,
         key["private_key"],
         algorithm="PS256",
         headers={"kid": key["id"]},
     )
-
     resp = requests.post(
         "https://iam.api.cloud.yandex.net/iam/v1/tokens",
-        json={"jwt": signed_jwt},
+        json={"jwt": signed},
         timeout=10
     )
     resp.raise_for_status()
     data = resp.json()
-
-    _IAM_TOKEN = data["iamToken"]
+    _IAM_TOKEN   = data["iamToken"]
     _IAM_EXPIRES = now + 3600 * 11
     return _IAM_TOKEN
 
-# --- 3. OCR через Yandex Vision ---
+# --- 3. OCR ---
 def yandex_ocr(img_bytes: bytes) -> str:
     token = get_iam_token()
     img_b64 = base64.b64encode(img_bytes).decode('utf-8')
@@ -85,8 +84,7 @@ def yandex_ocr(img_bytes: bytes) -> str:
             }]
         }]
     }
-
-    resp = requests.post(
+    r = requests.post(
         "https://vision.api.cloud.yandex.net/vision/v1/batchAnalyze",
         headers={
             "Authorization": f"Bearer {token}",
@@ -95,9 +93,8 @@ def yandex_ocr(img_bytes: bytes) -> str:
         json=payload,
         timeout=20
     )
-    resp.raise_for_status()
-    res = resp.json()
-
+    r.raise_for_status()
+    res = r.json()
     try:
         blocks = res["results"][0]["results"][0]["textDetection"]["pages"][0]["blocks"]
         lines = []
@@ -109,59 +106,57 @@ def yandex_ocr(img_bytes: bytes) -> str:
         logger.error("OCR parsing error: %s\nRaw response: %s", e, res)
         return ""
 
-# --- 4. Телеграм-хендлеры ---
+# --- 4. Парсер текста ---
+def parse_text(text: str):
+    # Task ID
+    tid = re.search(r'\[([0-9]+/[0-9]+)\]', text)
+    task_id = tid.group(1) if tid else 'не найден'
+
+    # Task Slug
+    slug = re.search(r'\][\s–:]*([A-Za-zА-Яа-я0-9_]+)', text)
+    task_slug = slug.group(1) if slug else 'не найден'
+
+    # Task Name
+    task_name = task_slug.replace('_', ' ')
+
+    # Time spent
+    tm = re.search(r'[Вв]ремя[: ]+(\d+\s*[чh]\s*\d+\s*[ммин]+)', text)
+    time_spent = tm.group(1) if tm else 'не найдено'
+
+    # Distance km
+    km = re.search(r'\(\s*(\d+)\s*км\s*\)', text) or re.search(r'(\d+)\s*км', text)
+    distance_km = km.group(1) if km else 'не найдено'
+
+    return task_id, task_name, time_spent, distance_km
+
+# --- 5. Telegram handlers ---
 @dp.message_handler(commands=['start'])
 async def cmd_start(msg: types.Message):
-    await msg.reply(
-        "Привет! Отправь фото — я распознаю *Task ID*, *Задание* и *Километраж* через Яндекс Vision OCR.",
-        parse_mode='Markdown'
-    )
+    await msg.reply("Привет! Отправь фото — я распознаю Task ID, название задания и километраж.")
 
 @dp.message_handler(content_types=['photo'])
 async def handle_photo(msg: types.Message):
-    # Скачиваем изображение
     f_info = await bot.get_file(msg.photo[-1].file_id)
     bio = io.BytesIO()
     await bot.download_file(f_info.file_path, destination=bio)
-    img_bytes = bio.getvalue()
+    bio.seek(0)
 
-    # OCR
-    text = yandex_ocr(img_bytes)
+    text = yandex_ocr(bio.read())
     if not text:
-        return await msg.reply("❌ Не удалось распознать текст.")
+        return await msg.reply("Не удалось распознать текст.")
 
-    # 1) Task ID: цифры внутри [..]
-    tid_m = re.search(r'\[([^\]]+)\]', text)
-    task_id = tid_m.group(1) if tid_m else '—'
+    task_id, task_name, time_spent, distance_km = parse_text(text)
 
-    # 2) Raw slug (первую строку) — то, что нужно вставить в задание
-    first_line = text.splitlines()[0].strip()
-
-    # 3) Название после «Задание:»
-    jt_m = re.search(r'[Зз]адани[ея][: ]+([^\n,;]+)', text)
-    job_part = jt_m.group(1).strip() if jt_m else ''
-
-    # Собираем полное задание: первая строка + доп. название
-    if job_part:
-        job_full = f"{first_line} — {job_part}"
-    else:
-        job_full = first_line
-
-    # 4) Километраж: сначала в скобках "(NN км)", иначе просто "NN км"
-    km_m = re.search(r'\(\s*(\d+(?:[.,]\d+)?)\s*км\s*\)', text)
-    if not km_m:
-        km_m = re.search(r'(\d+(?:[.,]\d+)?)\s*км', text)
-    km = km_m.group(1).replace(',', '.') if km_m else 'не найдено'
-
-    # Ответ пользователю
     await msg.reply(
-        f"📋 *Распознано:*\n"
-        f"– Task ID: `{task_id}`\n"
-        f"– Задание: `{job_full}`\n"
-        f"– Километраж: `{km} км`\n\n"
-        f"🗒 *Текст:*\n```{text}```",
+        f"📋 *Распознано:*  \n"
+        f"– Task ID: `{task_id}`  \n"
+        f"– Задание: `{task_name}`  \n"
+        f"– Время: `{time_spent}`  \n"
+        f"– Километраж: `{distance_km} км`  \n\n"
+        f"🗒 Текст:\n```{text}```",
         parse_mode='Markdown'
     )
 
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True)
+
